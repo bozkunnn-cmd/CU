@@ -1,6 +1,6 @@
 --[[
     CULTIVATION UNBOUND - AUTO CULTIVATION + ECONOMY
-    Version: 1.0.8.5
+    Version: 1.0.8.3.1
 
     Built on the user's working Auto Breakthrough v0.2.
 
@@ -16,10 +16,10 @@
         uses the live event title rather than assuming internal realm numbering.
       - Ordinary tribulation processing does not require a readable hit counter.
       - Anti-AFK toggle using LocalPlayer.Idled / VirtualUser.
-      - Auto Herb Collection: cached prompt index across normal HerbSpots and
-        SpiritWorld.Herbs; reads HerbYear and prioritizes oldest age first.
-      - Faster verified collection: adaptive arrival checks, no failed zero-duration
-        prompt probe, exact configured hold duration, and short target handoff delay.
+      - Auto Herb Collection: scans enabled CollectHerbPrompt objects in both
+        normal HerbSpots and SpiritWorld.Herbs folders; reads HerbYear and
+        prioritizes oldest age first, with optional species filters.
+      - Holds the real 2.5-second collection prompt and verifies the result.
       - Temporarily pauses cultivation during a herb sweep, then resumes.
       - Auto Brew: exact recipe validation, independently selectable 1/10/100/1000-year ingredient ages,
         no fallback to disabled ages, timed Stoke, and verified automatic claiming.
@@ -146,20 +146,7 @@ local INHERITANCE = {
     claimEnteredAt = nil,
     activeName = "waiting for event",
 }
-local HERB_MONITOR = {
-    ageCounts = nil,
-    lastScanAt = 0,
-    ageOptions = {1000, 100, 10, 1},
-    ageSelection = {[1] = true, [10] = true, [100] = true, [1000] = true},
-    promptCache = {entries = {}, refreshedAt = 0, refreshInterval = 0.35, refreshCount = 0},
-    speed = {
-        normalConfirmTimeout = 0.55,
-        arrivalTimeout = 0.65,
-        arrivalPoll = 0.025,
-        pauseConfirmTimeout = 0.25,
-        betweenTargets = 0.04,
-    },
-}
+local HERB_MONITOR = {ageCounts = nil, lastScanAt = 0, ageOptions = {1000, 100, 10, 1}, ageSelection = {[1] = true, [10] = true, [100] = true, [1000] = true}}
 local HERB_HOP = {
     enabled = false,
     graceSeconds = 60,
@@ -622,9 +609,7 @@ do
         if type(data.breakthroughEnabled) == "boolean" then breakthroughEnabled = data.breakthroughEnabled end
         if type(data.antiAfkEnabled) == "boolean" then antiAfkEnabled = data.antiAfkEnabled end
         if type(data.autoHerbsEnabled) == "boolean" then autoHerbsEnabled = data.autoHerbsEnabled end
-        -- The latest observer run recorded 0 confirmed zero-duration prompt interactions.
-        -- Do not restore the obsolete quick-probe setting from older settings files.
-        QUICK_INTERACT.enabled = false
+        if type(data.quickInteractEnabled) == "boolean" then QUICK_INTERACT.enabled = data.quickInteractEnabled end
         if type(data.autoBrewEnabled) == "boolean" then autoBrewEnabled = data.autoBrewEnabled end
         if type(data.autoHopNo1kHerbs) == "boolean" then HERB_HOP.enabled = data.autoHopNo1kHerbs end
         local hopGrace = tonumber(data.autoHopGraceSeconds)
@@ -682,7 +667,7 @@ do
         end
         local data = {
             schema = SETTINGS.schema,
-            version = "1.0.8.5",
+            version = "1.0.8.3.1",
             placeId = game.PlaceId,
             savedAt = os.time(),
             reason = tostring(reason or "setting_changed"),
@@ -697,7 +682,7 @@ do
                 ["1000"] = HERB_MONITOR.ageSelection[1000] == true,
             },
             herbSpeciesSelection = {},
-            quickInteractEnabled = false,
+            quickInteractEnabled = QUICK_INTERACT.enabled == true,
             autoBrewEnabled = autoBrewEnabled == true,
             autoSellEnabled = AUTO_SELL.enabled == true,
             autoSellConfig = AUTO_SELL.config,
@@ -2672,7 +2657,7 @@ HERB_MONITOR.getAgeScanInterval = function()
         and HERB_MONITOR.ageSelection[100] ~= true
         and HERB_MONITOR.ageSelection[10] ~= true
         and HERB_MONITOR.ageSelection[1] ~= true
-    return only1000 and 0.40 or 0.70
+    return only1000 and 0.85 or 1.5
 end
 
 local function getHerbFolders()
@@ -2689,35 +2674,6 @@ local function getHerbFolders()
     return folders
 end
 
--- Reuse prompt references between collection passes. Enabled/Picked/age and
--- position are always checked live, while expensive GetDescendants calls are
--- throttled to one refresh per short cache window.
-HERB_MONITOR.getPromptEntries = function(forceRefresh)
-    local now = os.clock()
-    if not forceRefresh and now - HERB_MONITOR.promptCache.refreshedAt < HERB_MONITOR.promptCache.refreshInterval then
-        return HERB_MONITOR.promptCache.entries
-    end
-
-    local entries = {}
-    for _, folder in ipairs(getHerbFolders()) do
-        local ok, descendants = pcall(function()
-            return folder:GetDescendants()
-        end)
-        if ok then
-            for _, node in ipairs(descendants) do
-                if node:IsA("ProximityPrompt") and node.Name == "CollectHerbPrompt" then
-                    table.insert(entries, {prompt = node, source = folder.Name})
-                end
-            end
-        end
-    end
-
-    HERB_MONITOR.promptCache.entries = entries
-    HERB_MONITOR.promptCache.refreshedAt = now
-    HERB_MONITOR.promptCache.refreshCount = HERB_MONITOR.promptCache.refreshCount + 1
-    return entries
-end
-
 HERB_HOP.isStrict1000Only = function()
     return HERB_MONITOR.ageSelection[1000] == true
         and HERB_MONITOR.ageSelection[100] ~= true
@@ -2731,31 +2687,32 @@ end
 HERB_HOP.countAvailable1000 = function()
     local count = 0
     local scanned = 0
-    local entries = HERB_MONITOR.getPromptEntries(false)
-    for _, entry in ipairs(entries) do
-        local node = entry.prompt
-        if node and node.Parent then
-            scanned = scanned + 1
-            if node.Enabled then
-                local picked = false
-                local parent = node.Parent
-                local depth = 0
-                while parent and depth < 6 do
-                    local ok, value = pcall(function() return parent:GetAttribute("Picked") end)
-                    if ok and value == true then picked = true break end
-                    parent = parent.Parent
-                    depth = depth + 1
-                end
-                if not picked and not herbCollectedPrompts[node] then
-                    local species, age = getHerbMetadata(node)
-                    if age == 1000 and isHerbSpeciesAllowed(species) then
-                        count = count + 1
+    local folders = getHerbFolders()
+    for _, folder in ipairs(folders) do
+        for _, node in ipairs(folder:GetDescendants()) do
+            if node:IsA("ProximityPrompt") and node.Name == "CollectHerbPrompt" and node.Parent then
+                scanned = scanned + 1
+                if node.Enabled then
+                    local picked = false
+                    local parent = node.Parent
+                    local depth = 0
+                    while parent and depth < 6 do
+                        local ok, value = pcall(function() return parent:GetAttribute("Picked") end)
+                        if ok and value == true then picked = true break end
+                        parent = parent.Parent
+                        depth = depth + 1
+                    end
+                    if not picked and not herbCollectedPrompts[node] then
+                        local species, age = getHerbMetadata(node)
+                        if age == 1000 and isHerbSpeciesAllowed(species) then
+                            count = count + 1
+                        end
                     end
                 end
             end
         end
     end
-    return count, scanned, #getHerbFolders()
+    return count, scanned, #folders
 end
 
 HERB_HOP.resetEmptyTimer = function(reason)
@@ -2844,33 +2801,42 @@ local function findNearestHerbPrompt()
     local bestAgeRank = -1
     local now = os.clock()
 
-    for _, entry in ipairs(HERB_MONITOR.getPromptEntries(false)) do
-        local descendant = entry.prompt
-        if descendant and descendant.Parent then
-            if herbCollectedPrompts[descendant] and not descendant.Enabled then
-                herbCollectedPrompts[descendant] = nil
-            end
+    for _, folder in ipairs(getHerbFolders()) do
+        for _, descendant in ipairs(folder:GetDescendants()) do
+            if descendant:IsA("ProximityPrompt")
+                and descendant.Name == "CollectHerbPrompt"
+                and descendant.Parent then
 
-            local alreadyCollected = herbCollectedPrompts[descendant] == true
-            local picked = HERB_MONITOR.isPicked and HERB_MONITOR.isPicked(descendant) or false
-            local lastAttempt = herbAttemptTimes[descendant]
-            local coolingDown = lastAttempt and (now - lastAttempt < 12)
-            if descendant.Enabled and not alreadyCollected and not picked and not coolingDown then
-                local species, age = getHerbMetadata(descendant)
-                if isHerbSpeciesAllowed(species) and HERB_MONITOR.isAgeAllowed(age) then
-                    local position = getHerbPromptPosition(descendant)
-                    if position then
-                        local distance = (root.Position - position).Magnitude
-                        -- Highest HerbYear wins; distance breaks ties.
-                        local ageRank = age or -1
-                        if ageRank > bestAgeRank
-                            or (ageRank == bestAgeRank and distance < bestDistance) then
-                            bestPrompt = descendant
-                            bestPosition = position
-                            bestName = species
-                            bestAge = age
-                            bestDistance = distance
-                            bestAgeRank = ageRank
+                if herbCollectedPrompts[descendant] and not descendant.Enabled then
+                    herbCollectedPrompts[descendant] = nil
+                end
+
+                local alreadyCollected = herbCollectedPrompts[descendant] == true
+                local picked = false
+                pcall(function()
+                    picked = descendant.Parent:GetAttribute("Picked") == true
+                end)
+
+                local lastAttempt = herbAttemptTimes[descendant]
+                local coolingDown = lastAttempt and (now - lastAttempt < 12)
+                if descendant.Enabled and not alreadyCollected and not picked and not coolingDown then
+                    local species, age = getHerbMetadata(descendant)
+                    if isHerbSpeciesAllowed(species) and HERB_MONITOR.isAgeAllowed(age) then
+                        local position = getHerbPromptPosition(descendant)
+                        if position then
+                            local distance = (root.Position - position).Magnitude
+                            -- Highest HerbYear always wins; distance breaks ties.
+                            -- Missing age is ranked below known 1-year herbs.
+                            local ageRank = age or -1
+                            if ageRank > bestAgeRank
+                                or (ageRank == bestAgeRank and distance < bestDistance) then
+                                bestPrompt = descendant
+                                bestPosition = position
+                                bestName = species
+                                bestAge = age
+                                bestDistance = distance
+                                bestAgeRank = ageRank
+                            end
                         end
                     end
                 end
@@ -2887,47 +2853,42 @@ local function herbWait(seconds)
         if not running or not autoHerbsEnabled or paused or UI.heavenly.active then
             return false
         end
-        task.wait(0.025)
+        task.wait(0.05)
     end
     return true
-end
-
-HERB_MONITOR.isPromptConfirmed = function(prompt, inventoryBefore)
-    if herbInventoryRevision > (inventoryBefore or 0) then
-        return true
-    end
-    if not prompt or not prompt.Parent or not prompt.Enabled then
-        return true
-    end
-    if HERB_MONITOR.isPicked then
-        return HERB_MONITOR.isPicked(prompt)
-    end
-    local picked = false
-    pcall(function()
-        picked = prompt.Parent and prompt.Parent:GetAttribute("Picked") == true
-    end)
-    return picked
-end
-
-HERB_MONITOR.waitForConfirmation = function(prompt, inventoryBefore, timeout)
-    local deadline = os.clock() + (timeout or HERB_MONITOR.speed.normalConfirmTimeout)
-    repeat
-        if HERB_MONITOR.isPromptConfirmed(prompt, inventoryBefore) then
-            return true
-        end
-        if not running or not autoHerbsEnabled or paused or UI.heavenly.active then
-            return false, "cancelled"
-        end
-        task.wait(0.025)
-    until os.clock() >= deadline
-    return HERB_MONITOR.isPromptConfirmed(prompt, inventoryBefore), "confirmation timeout"
 end
 
 local function holdHerbPrompt(prompt, inventoryBefore)
     local holdDuration = math.clamp(tonumber(prompt.HoldDuration) or 2.5, 0.1, 5)
 
-    -- Observer evidence: 22 zero-duration probes produced no confirmed collections.
-    -- Skip the failed 0.55s probe and use the normal server-validated hold directly.
+    -- Optional quick-interaction probe: fires the actual ProximityPrompt through
+    -- the executor helper, then requires a real inventory/prompt-state confirmation.
+    -- If the server enforces HoldDuration, it falls back to the normal hold.
+    if QUICK_INTERACT.enabled and type(fireproximityprompt) == "function" then
+        QUICK_INTERACT.attempts = QUICK_INTERACT.attempts + 1
+        DIAG.log("INFO", "HERBS", "quick_interact_attempt", {prompt = prompt:GetFullName(), species = getHerbPromptName(prompt), age = select(2, getHerbMetadata(prompt)), holdDuration = holdDuration})
+        local quickOk, quickErr = pcall(fireproximityprompt, prompt, 0)
+        if quickOk then
+            local deadline = os.clock() + 0.55
+            while os.clock() < deadline do
+                local picked = false
+                pcall(function() picked = prompt.Parent and prompt.Parent:GetAttribute("Picked") == true end)
+                if herbInventoryRevision > (inventoryBefore or 0) or not prompt.Parent or not prompt.Enabled or picked then
+                    QUICK_INTERACT.successes = QUICK_INTERACT.successes + 1
+                    DIAG.log("INFO", "HERBS", "quick_interact_verified", {prompt = prompt.Name, species = getHerbPromptName(prompt), age = select(2, getHerbMetadata(prompt))})
+                    return true, "quick prompt (verified)"
+                end
+                task.wait(0.05)
+            end
+        else
+            DIAG.log("WARN", "HERBS", "quick_interact_api_failed", {reason = tostring(quickErr)})
+        end
+        QUICK_INTERACT.fallbacks = QUICK_INTERACT.fallbacks + 1
+        DIAG.log("WARN", "HERBS", "quick_interact_not_confirmed_fallback", {prompt = prompt.Name, holdDuration = holdDuration})
+    elseif QUICK_INTERACT.enabled then
+        QUICK_INTERACT.fallbacks = QUICK_INTERACT.fallbacks + 1
+        DIAG.log("WARN", "HERBS", "quick_interact_api_unavailable", {prompt = prompt.Name, fallback = "normal hold"})
+    end
 
     -- Prefer the real ProximityPrompt hold lifecycle. It respects the game's
     -- HoldDuration and lets the server validate the normal interaction.
@@ -2935,17 +2896,17 @@ local function holdHerbPrompt(prompt, inventoryBefore)
         prompt:InputHoldBegin()
     end)
     if began then
-        local completed = herbWait(holdDuration)
+        local completed = herbWait(holdDuration + 0.12)
         pcall(function()
             prompt:InputHoldEnd()
         end)
-        return completed, completed and "ProximityPrompt hold" or "cancelled", false
+        return completed, completed and "ProximityPrompt hold" or "cancelled"
     end
 
     -- Executor compatibility fallback. This still targets the actual prompt.
     if type(fireproximityprompt) == "function" then
         local ok, err = pcall(fireproximityprompt, prompt, holdDuration)
-        return ok, ok and "fireproximityprompt" or tostring(err), false
+        return ok, ok and "fireproximityprompt" or tostring(err)
     end
 
     -- Last fallback: hold E through VirtualInputManager for the prompt's
@@ -2967,11 +2928,11 @@ local function holdHerbPrompt(prompt, inventoryBefore)
     if not keyDown then
         return false, "could not press E"
     end
-    local completed = herbWait(holdDuration)
+    local completed = herbWait(holdDuration + 0.12)
     pcall(function()
         virtualInput:SendKeyEvent(false, Enum.KeyCode.E, false, game)
     end)
-    return completed, completed and "VirtualInputManager E hold" or "cancelled", false
+    return completed, completed and "VirtualInputManager E hold" or "cancelled"
 end
 
 local function getHerbResumeMode()
@@ -2994,24 +2955,14 @@ local function beginHerbSweep()
 
     local root = getCharacterParts()
     herbReturnCFrame = root and root.CFrame or nil
+
     herbResumeMode = getHerbResumeMode()
     herbCollectorBusy = true
 
     if herbResumeMode and isTrainingActive(herbResumeMode) then
         local key = herbResumeMode == "Qi" and Enum.KeyCode.M or Enum.KeyCode.P
-        local pauseStarted = os.clock()
-        local sent, backend = sendKey(key)
-        local deadline = os.clock() + HERB_MONITOR.speed.pauseConfirmTimeout
-        while running and isTrainingActive(herbResumeMode) and os.clock() < deadline do
-            task.wait(0.025)
-        end
-        DIAG.log("INFO", "HERBS", "training_pause_for_sweep", {
-            mode = herbResumeMode,
-            inputSent = sent,
-            backend = backend,
-            confirmedStopped = not isTrainingActive(herbResumeMode),
-            waitSeconds = os.clock() - pauseStarted,
-        })
+        sendKey(key)
+        task.wait(0.35)
     end
 end
 
@@ -3045,48 +2996,11 @@ local function finishHerbSweep(reason)
     setHerbStatus(reason or "waiting for herbs")
 end
 
-HERB_MONITOR.waitForArrival = function(prompt, fallbackPosition, maxDistance)
-    local startedAt = os.clock()
-    local deadline = startedAt + HERB_MONITOR.speed.arrivalTimeout
-    local stableSamples = 0
-    local lastRoot, lastPosition, lastDistance = nil, fallbackPosition, math.huge
-
-    repeat
-        if not running or not autoHerbsEnabled or paused or UI.heavenly.active then
-            return false, lastRoot, lastPosition, lastDistance, "cancelled"
-        end
-        if not prompt or not prompt.Parent or not prompt.Enabled then
-            return false, lastRoot, lastPosition, lastDistance, "herb became unavailable while moving"
-        end
-
-        lastRoot = getCharacterParts()
-        if not lastRoot then
-            return false, nil, lastPosition, lastDistance, "character unavailable after moving"
-        end
-        lastPosition = getHerbPromptPosition(prompt) or fallbackPosition
-        lastDistance = lastPosition and (lastRoot.Position - lastPosition).Magnitude or math.huge
-
-        if lastDistance <= math.max(0.5, maxDistance - 0.25) then
-            stableSamples = stableSamples + 1
-            if stableSamples >= 2 then
-                return true, lastRoot, lastPosition, lastDistance, os.clock() - startedAt
-            end
-        else
-            stableSamples = 0
-        end
-        task.wait(HERB_MONITOR.speed.arrivalPoll)
-    until os.clock() >= deadline
-
-    return false, lastRoot, lastPosition, lastDistance, "arrival not verified within timeout"
-end
-
 local function collectHerbPrompt(prompt, position, herbName, herbAge)
-    local collectStartedAt = os.clock()
     if not prompt or not prompt.Parent or not prompt.Enabled then
         return false, "herb is no longer available"
     end
 
-    position = getHerbPromptPosition(prompt) or position
     local root = getCharacterParts()
     if not root then
         return false, "waiting for character"
@@ -3094,39 +3008,26 @@ local function collectHerbPrompt(prompt, position, herbName, herbAge)
 
     local maxDistance = tonumber(prompt.MaxActivationDistance) or 10
     local distance = (root.Position - position).Magnitude
-    if distance > math.max(0.5, maxDistance - 1.0) then
-        local verticalOffset = math.max(0.5, math.min(3.0, maxDistance * 0.35))
-        local destination = position + Vector3.new(0, verticalOffset, 0)
+    if distance > math.max(2, maxDistance - 1.0) then
+        local destination = position + Vector3.new(0, 3.0, 0)
         local look = root.CFrame.LookVector
-        DIAG.log("INFO", "HERBS", "teleport_to_herb_started", {
-            species = herbName, age = herbAge, distance = distance,
-            promptRange = maxDistance, destination = destination,
-        })
         local moved, moveError = pcall(function()
             root.AssemblyLinearVelocity = Vector3.zero
             root.AssemblyAngularVelocity = Vector3.zero
             root.CFrame = CFrame.new(destination, destination + look)
         end)
         if not moved then
-            DIAG.log("ERROR", "HERBS", "teleport_to_herb_failed", {reason = tostring(moveError), species = herbName, age = herbAge})
             return false, "teleport failed: " .. tostring(moveError)
         end
-
-        local arrived, arrivedRoot, arrivedPosition, arrivedDistance, arrivalResult = HERB_MONITOR.waitForArrival(prompt, position, maxDistance)
-        if not arrived then
-            DIAG.log("WARN", "HERBS", "teleport_to_herb_not_verified", {
-                species = herbName, age = herbAge, distance = arrivedDistance,
-                result = tostring(arrivalResult),
-            })
-            return false, tostring(arrivalResult)
+        if not herbWait(1.0) then
+            return false, "cancelled"
         end
-        root = arrivedRoot
-        position = arrivedPosition or position
-        distance = arrivedDistance
-        DIAG.log("INFO", "HERBS", "teleport_to_herb_arrived", {
-            species = herbName, age = herbAge, distance = distance,
-            arrivalSeconds = arrivalResult,
-        })
+        root = getCharacterParts()
+        if not root then
+            return false, "character unavailable after moving"
+        end
+        position = getHerbPromptPosition(prompt) or position
+        distance = (root.Position - position).Magnitude
     end
 
     if not prompt.Parent or not prompt.Enabled then
@@ -3138,45 +3039,27 @@ local function collectHerbPrompt(prompt, position, herbName, herbAge)
 
     local inventoryBefore = herbInventoryRevision
     DIAG.log("INFO", "HERBS", "collect_attempt", {species = herbName, age = herbAge, prompt = prompt:GetFullName(), holdDuration = prompt.HoldDuration, distance = distance, quickInteract = QUICK_INTERACT.enabled})
-    local sent, backend, alreadyConfirmed = holdHerbPrompt(prompt, inventoryBefore)
+    local sent, backend = holdHerbPrompt(prompt, inventoryBefore)
     if not sent then
         if backend == "cancelled" then
             return false, "cancelled"
         end
         return false, "input failed: " .. tostring(backend)
     end
-
-    if not alreadyConfirmed then
-        local confirmed, confirmationReason = HERB_MONITOR.waitForConfirmation(prompt, inventoryBefore, HERB_MONITOR.speed.normalConfirmTimeout)
-        if not confirmed then
-            if confirmationReason == "cancelled" then return false, "cancelled" end
-            herbFailedCount = herbFailedCount + 1
-            DIAG.log("WARN", "HERBS", "collect_not_verified", {
-                species = herbName, age = herbAge, backend = backend,
-                promptEnabled = prompt and prompt.Enabled,
-                inventoryRevision = herbInventoryRevision,
-                confirmationWait = HERB_MONITOR.speed.normalConfirmTimeout,
-            })
-            return false, "no inventory/prompt confirmation; will retry later"
-        end
+    if not herbWait(0.55) then
+        return false, "cancelled"
     end
 
     local inventoryChanged = herbInventoryRevision > inventoryBefore
     local promptConsumed = not prompt.Parent or not prompt.Enabled
-    local promptPicked = HERB_MONITOR.isPicked and HERB_MONITOR.isPicked(prompt) or false
-    if inventoryChanged or promptConsumed or promptPicked then
+    if inventoryChanged or promptConsumed then
         herbCollectedCount = herbCollectedCount + 1
         if prompt.Parent and prompt.Enabled then
             herbCollectedPrompts[prompt] = true
         end
         local ageText = herbAge and (tostring(herbAge) .. "-year") or "age unknown"
         setHerbStatus("collected " .. herbName .. " (" .. ageText .. ")")
-        DIAG.log("INFO", "HERBS", "collect_verified", {
-            species = herbName, age = herbAge, backend = backend,
-            inventoryRevision = herbInventoryRevision,
-            collectSeconds = os.clock() - collectStartedAt,
-            quickConfirmationReused = alreadyConfirmed == true,
-        })
+        DIAG.log("INFO", "HERBS", "collect_verified", {species = herbName, age = herbAge, backend = backend, inventoryRevision = herbInventoryRevision})
         print("[CU AutoCultivation] Collected " .. herbName .. " (" .. ageText .. ") via " .. tostring(backend))
         return true, "collected"
     end
@@ -3248,7 +3131,7 @@ local function runHerbCollector()
                         else
                             setHerbStatus(tostring(herbName) .. ": " .. tostring(result))
                         end
-                        task.wait(HERB_MONITOR.speed.betweenTargets)
+                        task.wait(0.15)
                     else
                         if herbCollectorBusy then
                             finishHerbSweep("sweep complete; checking respawns")
@@ -3297,20 +3180,21 @@ HERB_MONITOR.scan = function()
         Normal = {available = {[1] = 0, [10] = 0, [100] = 0, [1000] = 0, unknown = 0}, locked = 0},
         Spirit = {available = {[1] = 0, [10] = 0, [100] = 0, [1000] = 0, unknown = 0}, locked = 0},
     }
-    for _, entry in ipairs(HERB_MONITOR.getPromptEntries(false)) do
-        local node = entry.prompt
-        local source = entry.source == "HerbSpots" and "Normal" or "Spirit"
-        local bucket = counts[source]
-        if node and node.Parent then
-            local _, age = getHerbMetadata(node)
-            if node.Enabled and not HERB_MONITOR.isPicked(node) then
-                if age == 1 or age == 10 or age == 100 or age == 1000 then
-                    bucket.available[age] = bucket.available[age] + 1
+    for _, folder in ipairs(getHerbFolders()) do
+        local source = folder.Name == "HerbSpots" and "Normal" or "Spirit"
+        for _, node in ipairs(folder:GetDescendants()) do
+            if node:IsA("ProximityPrompt") and node.Name == "CollectHerbPrompt" then
+                local _, age = getHerbMetadata(node)
+                local bucket = counts[source]
+                if node.Enabled and not HERB_MONITOR.isPicked(node) then
+                    if age == 1 or age == 10 or age == 100 or age == 1000 then
+                        bucket.available[age] = bucket.available[age] + 1
+                    else
+                        bucket.available.unknown = bucket.available.unknown + 1
+                    end
                 else
-                    bucket.available.unknown = bucket.available.unknown + 1
+                    bucket.locked = bucket.locked + 1
                 end
-            else
-                bucket.locked = bucket.locked + 1
             end
         end
     end
@@ -4086,12 +3970,8 @@ updateModeButtons = function()
         brewButton.BackgroundColor3 = autoBrewEnabled and COLORS.success or COLORS.panel2
     end
     if UI.quickInteractButton then
-        UI.quickInteractButton.Text = "INSTANT HERB: SERVER HOLD REQUIRED"
-        UI.quickInteractButton.BackgroundColor3 = COLORS.panel2
-        UI.quickInteractButton.TextColor3 = COLORS.muted
-        UI.quickInteractButton.Active = false
-        UI.quickInteractButton.Selectable = false
-        UI.quickInteractButton.AutoButtonColor = false
+        UI.quickInteractButton.Text = QUICK_INTERACT.enabled and "INSTANT HERB: ON" or "INSTANT HERB: OFF"
+        UI.quickInteractButton.BackgroundColor3 = QUICK_INTERACT.enabled and COLORS.success or COLORS.panel2
     end
     if UI.autoHopNo1kButton then
         UI.autoHopNo1kButton.Text = HERB_HOP.enabled and "AUTO HOP: NO 1K HERBS ON" or "AUTO HOP: NO 1K HERBS OFF"
@@ -4531,7 +4411,7 @@ local function createGui()
         "CUAutoCultivation_v08", "CUAutoCultivation_v09", "CUAutoCultivation_v091",
         "CUAutoCultivation_v10", "CUAutoCultivation_v101", "CUAutoCultivation_v102",
         "CUAutoCultivation_v105", "CUAutoCultivation_v107", "CUAutoCultivation_v1081",
-        "CUAutoCultivation_v1082", "CUAutoCultivation_v1083", "CUAutoCultivation_v10831", "CUAutoCultivation_v1084", "CUAutoCultivation_v1085"
+        "CUAutoCultivation_v1082", "CUAutoCultivation_v1083", "CUAutoCultivation_v10831"
     }
     for _, oldName in ipairs(oldGuiNames) do
         local old = parent:FindFirstChild(oldName)
@@ -4539,7 +4419,7 @@ local function createGui()
     end
 
     gui = make("ScreenGui", {
-        Name = "CUAutoCultivation_v1085",
+        Name = "CUAutoCultivation_v10831",
         ResetOnSpawn = false,
         IgnoreGuiInset = false,
         DisplayOrder = 999900,
@@ -4599,7 +4479,7 @@ local function createGui()
         Size = UDim2.new(1, -110, 0, 25),
         BackgroundTransparency = 1,
         Font = Enum.Font.GothamBold,
-        Text = "CULTIVATION UNBOUND  |  AUTO SUITE v1.0.8.5",
+        Text = "CULTIVATION UNBOUND  |  AUTO SUITE v1.0.8.3.1",
         TextColor3 = Color3.fromRGB(246, 218, 157),
         TextSize = 14,
         TextXAlignment = Enum.TextXAlignment.Left,
@@ -4778,11 +4658,7 @@ local function createGui()
     UI.herbAgeFilterButton = makeButton(herbCard, "HERB AGE: ALL", 12, 59, 342, COLORS.panel2, 25)
     herbInfoLabel = makeLabel(herbCard, "Herbs: 0 collected | idle", 12, 92, 560, 16, 9, COLORS.muted)
     UI.herbMonitorLabel = makeLabel(herbCard, "Normal/Spirit 1/10/100/1k: scanning...", 12, 113, 560, 45, 9, COLORS.muted, Enum.Font.Code)
-    UI.quickInteractButton = makeButton(farmingPage, "INSTANT HERB: SERVER HOLD REQUIRED", 16, 246, 598, COLORS.panel2, 27)
-    UI.quickInteractButton.Active = false
-    UI.quickInteractButton.Selectable = false
-    UI.quickInteractButton.AutoButtonColor = false
-    UI.quickInteractButton.TextColor3 = COLORS.muted
+    UI.quickInteractButton = makeButton(farmingPage, "INSTANT HERB: OFF", 16, 246, 598, COLORS.panel2, 27)
     UI.autoHopNo1kButton = makeButton(farmingPage, "AUTO HOP: NO 1K HERBS OFF", 16, 280, 598, COLORS.panel2, 27)
     local autoSellCard = makeCard(farmingPage, 16, 316, 598, 78, "MERCHANT GAO | AUTO SELL HERBS", COLORS.warning)
     UI.autoSellButton = makeButton(autoSellCard, "AUTO SELL: OFF", 12, 28, 180, COLORS.panel2, 27)
@@ -4889,7 +4765,14 @@ local function createGui()
     end)
     autoSellRefreshConfig()
 
-    -- Instant Herb zero-duration probing is disabled: observer data showed 0/22 confirmations.
+    addConnection(UI.quickInteractButton.MouseButton1Click, function()
+        QUICK_INTERACT.enabled = not QUICK_INTERACT.enabled
+        if SETTINGS.save then SETTINGS.save("quick_interact_toggled") end
+        UI.quickInteractButton.Text = QUICK_INTERACT.enabled and "INSTANT HERB: ON" or "INSTANT HERB: OFF"
+        UI.quickInteractButton.BackgroundColor3 = QUICK_INTERACT.enabled and COLORS.success or COLORS.panel2
+        DIAG.log("INFO", "SETTINGS", "quick_interact_toggled", {enabled = QUICK_INTERACT.enabled})
+        setStatus(QUICK_INTERACT.enabled and "Instant herb interaction enabled; server confirmation is required, with normal hold fallback." or "Instant herb interaction disabled; herbs use the configured hold duration.", QUICK_INTERACT.enabled and COLORS.success or COLORS.warning)
+    end)
 
     -- ALCHEMY PAGE
     local alchemyPage = pageFrames.Alchemy
@@ -5615,16 +5498,7 @@ addConnection(LocalPlayer:GetAttributeChangedSignal("PrimordialStones"), refresh
 
 createGui()
 HERB_MONITOR.update(true)
-DIAG.log("INFO", "SYSTEM", "initialized", {version = "1.0.8.5", placeId = game.PlaceId, player = LocalPlayer.Name, quickHerb = QUICK_INTERACT.enabled, retiredModules = {"CHEST", "INHERITANCE", "SILVER", "EXPERIMENTS"}, settingsLoaded = SETTINGS.loaded})
-DIAG.log("INFO", "HERBS", "fast_cycle_config", {
-    promptCacheSeconds = HERB_MONITOR.promptCache.refreshInterval,
-    arrivalTimeoutSeconds = HERB_MONITOR.speed.arrivalTimeout,
-    normalConfirmTimeoutSeconds = HERB_MONITOR.speed.normalConfirmTimeout,
-    betweenTargetSeconds = HERB_MONITOR.speed.betweenTargets,
-    instantProbeEnabled = false,
-    instantProbeReason = "0 confirmed quick interactions in 22 recorded attempts",
-    promptHoldPaddingSeconds = 0,
-})
+DIAG.log("INFO", "SYSTEM", "initialized", {version = "1.0.8.3.1", placeId = game.PlaceId, player = LocalPlayer.Name, quickHerb = QUICK_INTERACT.enabled, retiredModules = {"CHEST", "INHERITANCE", "SILVER", "EXPERIMENTS"}, settingsLoaded = SETTINGS.loaded})
 DIAG.refreshUI(true)
 if UI.settingsStatusLabel then UI.settingsStatusLabel.Text = SETTINGS.status end
 
@@ -5776,10 +5650,10 @@ addConnection(RunService.RenderStepped, function()
     end
 end)
 
-print("[CU AutoCultivation] v1.0.8.5 loaded. Qi/Body cultivation, breakthrough, herbs and brewing retained.")
+print("[CU AutoCultivation] v1.0.8.3.1 loaded. Qi/Body cultivation, breakthrough, herbs and brewing retained.")
 print("[CU AutoCultivation] Retired: Auto Chest, Chest TP, Immortal Inheritance, Auto Silver and Experiments.")
 print("[CU AutoCultivation] Heavenly Tribulation: continuous-pulse rearming, smoothed ring velocity, short SPACE pulse, feedback-based timing calibration.")
 print("[CU AutoCultivation] No chest teleport, chest opening, inheritance travel, or Auto Silver runner is active in this release.")
 print("[CU AutoCultivation] Settings persist to " .. SETTINGS.file .. "; Settings tab has Private Rejoin and Public Server Hop.")
-DIAG.log("INFO", "SYSTEM", "ready", {version = "1.0.8.5"})
-setStatus("Loaded v1.0.8.5. Auto Hop waits for a confirmed empty 1k-herb scan, then uses public Server Hop.", COLORS.success)
+DIAG.log("INFO", "SYSTEM", "ready", {version = "1.0.8.3.1"})
+setStatus("Loaded v1.0.8.3.1. Auto Hop waits for a confirmed empty 1k-herb scan, then uses public Server Hop.", COLORS.success)
