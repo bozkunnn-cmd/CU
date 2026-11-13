@@ -1,6 +1,6 @@
 --[[
     CULTIVATION UNBOUND - AUTO CULTIVATION + ECONOMY
-    Version: 1.0.8.4
+    Version: 1.0.8.5
 
     Built on the user's working Auto Breakthrough v0.2.
 
@@ -18,8 +18,8 @@
       - Anti-AFK toggle using LocalPlayer.Idled / VirtualUser.
       - Auto Herb Collection: cached prompt index across normal HerbSpots and
         SpiritWorld.Herbs; reads HerbYear and prioritizes oldest age first.
-      - Faster verified collection: adaptive arrival checks, one confirmation
-        wait (no duplicate post-confirm delay), and short target handoff delay.
+      - Faster verified collection: adaptive arrival checks, no failed zero-duration
+        prompt probe, exact configured hold duration, and short target handoff delay.
       - Temporarily pauses cultivation during a herb sweep, then resumes.
       - Auto Brew: exact recipe validation, independently selectable 1/10/100/1000-year ingredient ages,
         no fallback to disabled ages, timed Stoke, and verified automatic claiming.
@@ -153,7 +153,6 @@ local HERB_MONITOR = {
     ageSelection = {[1] = true, [10] = true, [100] = true, [1000] = true},
     promptCache = {entries = {}, refreshedAt = 0, refreshInterval = 0.35, refreshCount = 0},
     speed = {
-        quickConfirmTimeout = 0.55,
         normalConfirmTimeout = 0.55,
         arrivalTimeout = 0.65,
         arrivalPoll = 0.025,
@@ -623,7 +622,9 @@ do
         if type(data.breakthroughEnabled) == "boolean" then breakthroughEnabled = data.breakthroughEnabled end
         if type(data.antiAfkEnabled) == "boolean" then antiAfkEnabled = data.antiAfkEnabled end
         if type(data.autoHerbsEnabled) == "boolean" then autoHerbsEnabled = data.autoHerbsEnabled end
-        if type(data.quickInteractEnabled) == "boolean" then QUICK_INTERACT.enabled = data.quickInteractEnabled end
+        -- The latest observer run recorded 0 confirmed zero-duration prompt interactions.
+        -- Do not restore the obsolete quick-probe setting from older settings files.
+        QUICK_INTERACT.enabled = false
         if type(data.autoBrewEnabled) == "boolean" then autoBrewEnabled = data.autoBrewEnabled end
         if type(data.autoHopNo1kHerbs) == "boolean" then HERB_HOP.enabled = data.autoHopNo1kHerbs end
         local hopGrace = tonumber(data.autoHopGraceSeconds)
@@ -681,7 +682,7 @@ do
         end
         local data = {
             schema = SETTINGS.schema,
-            version = "1.0.8.4",
+            version = "1.0.8.5",
             placeId = game.PlaceId,
             savedAt = os.time(),
             reason = tostring(reason or "setting_changed"),
@@ -696,7 +697,7 @@ do
                 ["1000"] = HERB_MONITOR.ageSelection[1000] == true,
             },
             herbSpeciesSelection = {},
-            quickInteractEnabled = QUICK_INTERACT.enabled == true,
+            quickInteractEnabled = false,
             autoBrewEnabled = autoBrewEnabled == true,
             autoSellEnabled = AUTO_SELL.enabled == true,
             autoSellConfig = AUTO_SELL.config,
@@ -2925,35 +2926,8 @@ end
 local function holdHerbPrompt(prompt, inventoryBefore)
     local holdDuration = math.clamp(tonumber(prompt.HoldDuration) or 2.5, 0.1, 5)
 
-    -- Optional quick-interaction probe: fires the actual ProximityPrompt through
-    -- the executor helper, then requires a real inventory/prompt-state confirmation.
-    -- If the server enforces HoldDuration, it falls back to the normal hold.
-    if QUICK_INTERACT.enabled and type(fireproximityprompt) == "function" then
-        QUICK_INTERACT.attempts = QUICK_INTERACT.attempts + 1
-        DIAG.log("INFO", "HERBS", "quick_interact_attempt", {prompt = prompt:GetFullName(), species = getHerbPromptName(prompt), age = select(2, getHerbMetadata(prompt)), holdDuration = holdDuration})
-        local quickOk, quickErr = pcall(fireproximityprompt, prompt, 0)
-        if quickOk then
-            local confirmed, confirmationReason = HERB_MONITOR.waitForConfirmation(prompt, inventoryBefore, HERB_MONITOR.speed.quickConfirmTimeout)
-            if confirmed then
-                QUICK_INTERACT.successes = QUICK_INTERACT.successes + 1
-                DIAG.log("INFO", "HERBS", "quick_interact_verified", {
-                    prompt = prompt.Name,
-                    species = getHerbPromptName(prompt),
-                    age = select(2, getHerbMetadata(prompt)),
-                })
-                return true, "quick prompt (verified)", true
-            elseif confirmationReason == "cancelled" then
-                return false, "cancelled", false
-            end
-        else
-            DIAG.log("WARN", "HERBS", "quick_interact_api_failed", {reason = tostring(quickErr)})
-        end
-        QUICK_INTERACT.fallbacks = QUICK_INTERACT.fallbacks + 1
-        DIAG.log("WARN", "HERBS", "quick_interact_not_confirmed_fallback", {prompt = prompt.Name, holdDuration = holdDuration})
-    elseif QUICK_INTERACT.enabled then
-        QUICK_INTERACT.fallbacks = QUICK_INTERACT.fallbacks + 1
-        DIAG.log("WARN", "HERBS", "quick_interact_api_unavailable", {prompt = prompt.Name, fallback = "normal hold"})
-    end
+    -- Observer evidence: 22 zero-duration probes produced no confirmed collections.
+    -- Skip the failed 0.55s probe and use the normal server-validated hold directly.
 
     -- Prefer the real ProximityPrompt hold lifecycle. It respects the game's
     -- HoldDuration and lets the server validate the normal interaction.
@@ -2961,7 +2935,7 @@ local function holdHerbPrompt(prompt, inventoryBefore)
         prompt:InputHoldBegin()
     end)
     if began then
-        local completed = herbWait(holdDuration + 0.12)
+        local completed = herbWait(holdDuration)
         pcall(function()
             prompt:InputHoldEnd()
         end)
@@ -2993,7 +2967,7 @@ local function holdHerbPrompt(prompt, inventoryBefore)
     if not keyDown then
         return false, "could not press E"
     end
-    local completed = herbWait(holdDuration + 0.12)
+    local completed = herbWait(holdDuration)
     pcall(function()
         virtualInput:SendKeyEvent(false, Enum.KeyCode.E, false, game)
     end)
@@ -4112,8 +4086,12 @@ updateModeButtons = function()
         brewButton.BackgroundColor3 = autoBrewEnabled and COLORS.success or COLORS.panel2
     end
     if UI.quickInteractButton then
-        UI.quickInteractButton.Text = QUICK_INTERACT.enabled and "INSTANT HERB: ON" or "INSTANT HERB: OFF"
-        UI.quickInteractButton.BackgroundColor3 = QUICK_INTERACT.enabled and COLORS.success or COLORS.panel2
+        UI.quickInteractButton.Text = "INSTANT HERB: SERVER HOLD REQUIRED"
+        UI.quickInteractButton.BackgroundColor3 = COLORS.panel2
+        UI.quickInteractButton.TextColor3 = COLORS.muted
+        UI.quickInteractButton.Active = false
+        UI.quickInteractButton.Selectable = false
+        UI.quickInteractButton.AutoButtonColor = false
     end
     if UI.autoHopNo1kButton then
         UI.autoHopNo1kButton.Text = HERB_HOP.enabled and "AUTO HOP: NO 1K HERBS ON" or "AUTO HOP: NO 1K HERBS OFF"
@@ -4553,7 +4531,7 @@ local function createGui()
         "CUAutoCultivation_v08", "CUAutoCultivation_v09", "CUAutoCultivation_v091",
         "CUAutoCultivation_v10", "CUAutoCultivation_v101", "CUAutoCultivation_v102",
         "CUAutoCultivation_v105", "CUAutoCultivation_v107", "CUAutoCultivation_v1081",
-        "CUAutoCultivation_v1082", "CUAutoCultivation_v1083", "CUAutoCultivation_v10831", "CUAutoCultivation_v1084"
+        "CUAutoCultivation_v1082", "CUAutoCultivation_v1083", "CUAutoCultivation_v10831", "CUAutoCultivation_v1084", "CUAutoCultivation_v1085"
     }
     for _, oldName in ipairs(oldGuiNames) do
         local old = parent:FindFirstChild(oldName)
@@ -4561,7 +4539,7 @@ local function createGui()
     end
 
     gui = make("ScreenGui", {
-        Name = "CUAutoCultivation_v1084",
+        Name = "CUAutoCultivation_v1085",
         ResetOnSpawn = false,
         IgnoreGuiInset = false,
         DisplayOrder = 999900,
@@ -4621,7 +4599,7 @@ local function createGui()
         Size = UDim2.new(1, -110, 0, 25),
         BackgroundTransparency = 1,
         Font = Enum.Font.GothamBold,
-        Text = "CULTIVATION UNBOUND  |  AUTO SUITE v1.0.8.4",
+        Text = "CULTIVATION UNBOUND  |  AUTO SUITE v1.0.8.5",
         TextColor3 = Color3.fromRGB(246, 218, 157),
         TextSize = 14,
         TextXAlignment = Enum.TextXAlignment.Left,
@@ -4800,7 +4778,11 @@ local function createGui()
     UI.herbAgeFilterButton = makeButton(herbCard, "HERB AGE: ALL", 12, 59, 342, COLORS.panel2, 25)
     herbInfoLabel = makeLabel(herbCard, "Herbs: 0 collected | idle", 12, 92, 560, 16, 9, COLORS.muted)
     UI.herbMonitorLabel = makeLabel(herbCard, "Normal/Spirit 1/10/100/1k: scanning...", 12, 113, 560, 45, 9, COLORS.muted, Enum.Font.Code)
-    UI.quickInteractButton = makeButton(farmingPage, "INSTANT HERB: OFF", 16, 246, 598, COLORS.panel2, 27)
+    UI.quickInteractButton = makeButton(farmingPage, "INSTANT HERB: SERVER HOLD REQUIRED", 16, 246, 598, COLORS.panel2, 27)
+    UI.quickInteractButton.Active = false
+    UI.quickInteractButton.Selectable = false
+    UI.quickInteractButton.AutoButtonColor = false
+    UI.quickInteractButton.TextColor3 = COLORS.muted
     UI.autoHopNo1kButton = makeButton(farmingPage, "AUTO HOP: NO 1K HERBS OFF", 16, 280, 598, COLORS.panel2, 27)
     local autoSellCard = makeCard(farmingPage, 16, 316, 598, 78, "MERCHANT GAO | AUTO SELL HERBS", COLORS.warning)
     UI.autoSellButton = makeButton(autoSellCard, "AUTO SELL: OFF", 12, 28, 180, COLORS.panel2, 27)
@@ -4907,14 +4889,7 @@ local function createGui()
     end)
     autoSellRefreshConfig()
 
-    addConnection(UI.quickInteractButton.MouseButton1Click, function()
-        QUICK_INTERACT.enabled = not QUICK_INTERACT.enabled
-        if SETTINGS.save then SETTINGS.save("quick_interact_toggled") end
-        UI.quickInteractButton.Text = QUICK_INTERACT.enabled and "INSTANT HERB: ON" or "INSTANT HERB: OFF"
-        UI.quickInteractButton.BackgroundColor3 = QUICK_INTERACT.enabled and COLORS.success or COLORS.panel2
-        DIAG.log("INFO", "SETTINGS", "quick_interact_toggled", {enabled = QUICK_INTERACT.enabled})
-        setStatus(QUICK_INTERACT.enabled and "Instant herb interaction enabled; server confirmation is required, with normal hold fallback." or "Instant herb interaction disabled; herbs use the configured hold duration.", QUICK_INTERACT.enabled and COLORS.success or COLORS.warning)
-    end)
+    -- Instant Herb zero-duration probing is disabled: observer data showed 0/22 confirmations.
 
     -- ALCHEMY PAGE
     local alchemyPage = pageFrames.Alchemy
@@ -5640,13 +5615,15 @@ addConnection(LocalPlayer:GetAttributeChangedSignal("PrimordialStones"), refresh
 
 createGui()
 HERB_MONITOR.update(true)
-DIAG.log("INFO", "SYSTEM", "initialized", {version = "1.0.8.4", placeId = game.PlaceId, player = LocalPlayer.Name, quickHerb = QUICK_INTERACT.enabled, retiredModules = {"CHEST", "INHERITANCE", "SILVER", "EXPERIMENTS"}, settingsLoaded = SETTINGS.loaded})
+DIAG.log("INFO", "SYSTEM", "initialized", {version = "1.0.8.5", placeId = game.PlaceId, player = LocalPlayer.Name, quickHerb = QUICK_INTERACT.enabled, retiredModules = {"CHEST", "INHERITANCE", "SILVER", "EXPERIMENTS"}, settingsLoaded = SETTINGS.loaded})
 DIAG.log("INFO", "HERBS", "fast_cycle_config", {
     promptCacheSeconds = HERB_MONITOR.promptCache.refreshInterval,
     arrivalTimeoutSeconds = HERB_MONITOR.speed.arrivalTimeout,
-    quickConfirmTimeoutSeconds = HERB_MONITOR.speed.quickConfirmTimeout,
     normalConfirmTimeoutSeconds = HERB_MONITOR.speed.normalConfirmTimeout,
     betweenTargetSeconds = HERB_MONITOR.speed.betweenTargets,
+    instantProbeEnabled = false,
+    instantProbeReason = "0 confirmed quick interactions in 22 recorded attempts",
+    promptHoldPaddingSeconds = 0,
 })
 DIAG.refreshUI(true)
 if UI.settingsStatusLabel then UI.settingsStatusLabel.Text = SETTINGS.status end
@@ -5799,10 +5776,10 @@ addConnection(RunService.RenderStepped, function()
     end
 end)
 
-print("[CU AutoCultivation] v1.0.8.4 loaded. Qi/Body cultivation, breakthrough, herbs and brewing retained.")
+print("[CU AutoCultivation] v1.0.8.5 loaded. Qi/Body cultivation, breakthrough, herbs and brewing retained.")
 print("[CU AutoCultivation] Retired: Auto Chest, Chest TP, Immortal Inheritance, Auto Silver and Experiments.")
 print("[CU AutoCultivation] Heavenly Tribulation: continuous-pulse rearming, smoothed ring velocity, short SPACE pulse, feedback-based timing calibration.")
 print("[CU AutoCultivation] No chest teleport, chest opening, inheritance travel, or Auto Silver runner is active in this release.")
 print("[CU AutoCultivation] Settings persist to " .. SETTINGS.file .. "; Settings tab has Private Rejoin and Public Server Hop.")
-DIAG.log("INFO", "SYSTEM", "ready", {version = "1.0.8.4"})
-setStatus("Loaded v1.0.8.4. Auto Hop waits for a confirmed empty 1k-herb scan, then uses public Server Hop.", COLORS.success)
+DIAG.log("INFO", "SYSTEM", "ready", {version = "1.0.8.5"})
+setStatus("Loaded v1.0.8.5. Auto Hop waits for a confirmed empty 1k-herb scan, then uses public Server Hop.", COLORS.success)
